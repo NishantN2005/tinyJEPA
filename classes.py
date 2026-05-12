@@ -1,3 +1,5 @@
+import torch.nn as nn
+
 class Encoder(nn.Module):
     """Small ConvNet that maps a (1, 28, 28) image patch to a 128-dim embedding."""
     def __init__(self, embed_dim=128):
