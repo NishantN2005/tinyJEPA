@@ -1,3 +1,4 @@
 jepa.env
 data
 tiny_jepa_encoder.pt
+__pycache__
