@@ -60,7 +60,7 @@ def train():
     train_set = datasets.MNIST("./data", train=True, download=True, transform=transform)
     loader = DataLoader(train_set, batch_size=128, shuffle=True)
 
-    encoder = Encoder().to(device)
+    encoder = Encoder(base_channels=64).to(device)
     predictor = Predictor(hidden=1024).to(device)
     target_encoder = copy.deepcopy(encoder).to(device)
     for p in target_encoder.parameters():
@@ -71,7 +71,7 @@ def train():
         lr=1e-3
     )
 
-    for epoch in range(40):
+    for epoch in range(200):
         for batch_idx, (images, _) in enumerate(loader):
             images = images.to(device)
             context, target = split_context_target(images)

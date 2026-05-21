@@ -7,7 +7,7 @@ from classes import Encoder
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     
-encoder = Encoder().to(device)
+encoder = Encoder(base_channels=64).to(device)
 encoder.load_state_dict(torch.load("tiny_jepa_encoder.pt"))
 encoder.eval()
 
