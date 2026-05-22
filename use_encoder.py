@@ -7,7 +7,7 @@ from classes import Encoder
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     
-encoder = Encoder(base_channels=64).to(device)
+encoder = Encoder(embed_dim=256).to(device)
 encoder.load_state_dict(torch.load("tiny_jepa_encoder.pt"))
 encoder.eval()
 
@@ -26,7 +26,7 @@ def linear_probe(encoder):
     train_loader = DataLoader(train_set, batch_size=256, shuffle=True)
     test_loader = DataLoader(test_set, batch_size=256)
 
-    classifier = nn.Linear(128, 10).to(device)
+    classifier = nn.Linear(256, 10).to(device)
     opt = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
     for epoch in range(5):

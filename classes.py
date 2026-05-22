@@ -1,24 +1,30 @@
 import torch.nn as nn
+from torchvision.models import resnet18
+
 
 class Encoder(nn.Module):
-    """Small ConvNet that maps a (1, 28, 28) image patch to a 128-dim embedding."""
-    def __init__(self, embed_dim=128, base_channels=32):
+    """ResNet-18 backbone adapted for 1-channel 28×28 MNIST patches.
+
+    Changes vs stock ResNet-18:
+      - conv1: 7×7 stride-2 → 3×3 stride-1  (keeps spatial resolution on tiny images)
+      - maxpool replaced with Identity         (avoids collapsing 28px input too early)
+      - fc replaced with a linear projection   (maps 512-d pool → embed_dim)
+    """
+    def __init__(self, embed_dim=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, base_channels, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(base_channels * 2, embed_dim),
-        )
+        backbone = resnet18()
+        backbone.conv1   = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        backbone.maxpool = nn.Identity()
+        backbone.fc      = nn.Linear(512, embed_dim)
+        self.net = backbone
+
     def forward(self, x):
         return self.net(x)
-    
+
+
 class Predictor(nn.Module):
     """MLP that maps a context embedding to a predicted target embedding."""
-    def __init__(self, embed_dim=128, hidden=256):
+    def __init__(self, embed_dim=256, hidden=1024):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(embed_dim, hidden),

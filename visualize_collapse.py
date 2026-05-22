@@ -55,15 +55,37 @@ def sigreg(z, num_projections=64, beta=1.0, lam=1.0):
 # training
 # ---------------------------------------------------------------------------
 
-def train(predictor_hidden: int, epochs: int, base_channels: int = 32):
+def train(epochs: int, embed_dim: int = 128, predictor_hidden: int = 1024,
+          base_channels: int = None, use_resnet: bool = False):
     loader = DataLoader(
         datasets.MNIST("./data", train=True, download=True,
                        transform=transforms.ToTensor()),
         batch_size=128, shuffle=True,
     )
 
-    encoder        = Encoder(base_channels=base_channels).to(device)
-    predictor      = Predictor(hidden=predictor_hidden).to(device)
+    if use_resnet:
+        encoder = Encoder(embed_dim=embed_dim).to(device)
+        label   = f"ResNet-18 embed={embed_dim}"
+    else:
+        from classes import Encoder as _Enc
+        import torch.nn as nn
+        from torchvision.models import resnet18 as _r
+        # rebuild a plain ConvNet inline so we don't break the ResNet Encoder class
+        ch = base_channels or 64
+        class _ConvEnc(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Conv2d(1, ch, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(ch, ch*2, 3, padding=1), nn.ReLU(),
+                    nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                    nn.Linear(ch*2, embed_dim),
+                )
+            def forward(self, x): return self.net(x)
+        encoder = _ConvEnc().to(device)
+        label   = f"ConvNet {ch}ch embed={embed_dim}"
+
+    predictor      = Predictor(embed_dim=embed_dim, hidden=predictor_hidden).to(device)
     target_encoder = copy.deepcopy(encoder).to(device)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -72,17 +94,14 @@ def train(predictor_hidden: int, epochs: int, base_channels: int = 32):
         list(encoder.parameters()) + list(predictor.parameters()), lr=1e-3
     )
 
-    label = f"enc={base_channels}ch pred={predictor_hidden}"
     for epoch in range(epochs):
         for images, _ in loader:
             images = images.to(device)
             ctx, tgt = split_context_target(images)
-
             ctx_embed  = encoder(ctx)
             pred_embed = predictor(ctx_embed)
             with torch.no_grad():
                 tgt_embed = target_encoder(tgt)
-
             loss = F.mse_loss(pred_embed, tgt_embed) + sigreg(ctx_embed, lam=0.1)
             opt.zero_grad(); loss.backward(); opt.step()
             ema_update(encoder, target_encoder)
@@ -96,7 +115,7 @@ def train(predictor_hidden: int, epochs: int, base_channels: int = 32):
 # linear probe
 # ---------------------------------------------------------------------------
 
-def linear_probe(encoder):
+def linear_probe(encoder, embed_dim=128):
     import torch.nn as nn
     encoder.eval()
     train_loader = DataLoader(
@@ -108,7 +127,7 @@ def linear_probe(encoder):
         batch_size=256,
     )
 
-    clf = nn.Linear(128, 10).to(device)
+    clf = nn.Linear(embed_dim, 10).to(device)
     opt = torch.optim.Adam(clf.parameters(), lr=1e-3)
 
     for _ in range(5):
@@ -176,72 +195,55 @@ def tsne_scatter(ax, embeds, labels, title, accuracy):
 
 
 def main():
-    # 2 encoder sizes × 3 predictor widths, all at 100 epochs
-    enc_configs    = [32, 64]
-    hidden_configs = [256, 512, 1024]
-    epochs         = 100
+    runs = [
+        dict(label="ConvNet  64ch  (91K params)\nPredictor hidden=1024  ·  100 epochs",
+             kwargs=dict(epochs=100, embed_dim=128, predictor_hidden=1024,
+                         base_channels=64, use_resnet=False),
+             embed_dim=128),
+        dict(label="ResNet-18  (11.3M params)\nPredictor hidden=1024  ·  100 epochs",
+             kwargs=dict(epochs=100, embed_dim=256, predictor_hidden=1024,
+                         use_resnet=True),
+             embed_dim=256),
+    ]
 
-    # Train all 6 combinations, collect results row-major (enc × hidden)
-    results = []   # list of dicts: enc, hidden, encoder, acc, emb, lbl
-    for ch in enc_configs:
-        for h in hidden_configs:
-            print(f"\n=== enc base_channels={ch}  predictor hidden={h}  {epochs} epochs ===")
-            enc = train(predictor_hidden=h, epochs=epochs, base_channels=ch)
-            print("  Running linear probe …")
-            acc = linear_probe(enc)
-            print(f"  Accuracy: {acc:.1%}")
-            print("  Collecting embeddings …")
-            emb, lbl = collect_embeddings(enc)
-            results.append(dict(ch=ch, h=h, acc=acc, emb=emb, lbl=lbl))
+    encoders, accuracies = [], []
+    for r in runs:
+        print(f"\n=== {r['label'].splitlines()[0]} ===")
+        enc = train(**r['kwargs'])
+        print("  Running linear probe …")
+        acc = linear_probe(enc, embed_dim=r['embed_dim'])
+        print(f"  Accuracy: {acc:.1%}")
+        encoders.append(enc)
+        accuracies.append(acc)
 
-    # ── 2 × 3 grid: rows = encoder size, cols = predictor hidden ──
-    print("\nRunning t-SNE and plotting …")
-    nrows, ncols = len(enc_configs), len(hidden_configs)
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(7 * ncols, 6 * nrows),
-                             facecolor="#1a1a2e")
-    for ax in axes.flat:
+    print("\nCollecting embeddings …")
+    embeddings = [collect_embeddings(enc) for enc in encoders]
+
+    print("Running t-SNE …")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#1a1a2e")
+    for ax in axes:
         ax.set_facecolor("#16213e")
 
-    for idx, r in enumerate(results):
-        row, col = divmod(idx, ncols)
-        enc_params = 27_136 if r['ch'] == 32 else 91_008
-        title = (f"Encoder {r['ch']}ch  ({enc_params//1000}K)  ·  "
-                 f"Predictor hidden={r['h']}")
-        tsne_scatter(axes[row, col], r['emb'], r['lbl'], title, r['acc'])
-
-    # Row labels
-    for row, ch in enumerate(enc_configs):
-        axes[row, 0].set_ylabel(
-            f"Encoder  {ch}ch", fontsize=13, color="white",
-            fontweight="bold", labelpad=10,
-        )
-
-    # Column labels
-    for col, h in enumerate(hidden_configs):
-        axes[0, col].set_title(
-            axes[0, col].get_title(),   # already set by tsne_scatter
-            fontsize=13, color="white",
-        )
+    for ax, (emb, lbl), r, acc in zip(axes, embeddings, runs, accuracies):
+        tsne_scatter(ax, emb, lbl, r['label'], acc)
 
     handles = [
         plt.Line2D([0], [0], marker="o", color="w",
-                   markerfacecolor=COLORS[i], markersize=9, label=str(i))
+                   markerfacecolor=COLORS[i], markersize=8, label=str(i))
         for i in range(10)
     ]
     fig.legend(handles=handles, title="Digit", ncol=10,
-               loc="lower center", bbox_to_anchor=(0.5, -0.01),
+               loc="lower center", bbox_to_anchor=(0.5, -0.02),
                framealpha=0.2, labelcolor="white",
-               title_fontsize=11, fontsize=10)
+               title_fontsize=10, fontsize=9)
     fig.suptitle(
-        f"tinyJEPA  ·  SIGReg  ·  Parameter sweep  ({epochs} epochs each)\n"
-        "Rows: encoder size   ·   Columns: predictor hidden dim",
-        fontsize=15, fontweight="bold", color="white", y=1.01,
+        "tinyJEPA  ·  SIGReg  ·  ConvNet vs ResNet-18 encoder  (100 epochs each)",
+        fontsize=14, fontweight="bold", color="white", y=1.01,
     )
     plt.tight_layout()
 
-    out = "assets/day1/param_sweep.png"
-    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    out = "assets/day1/resnet_comparison.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     print(f"\nSaved → {out}")
 
 
