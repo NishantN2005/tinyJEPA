@@ -63,8 +63,9 @@ def sigreg(z, num_projections=64, beta=1.0, lam=1.0):
     indiv_term = (2 / (1 + b2) ** 0.5) * \
                  torch.exp(-b2 / (2*(1+b2)) * y.pow(2)).sum(0)
     const_term = B / (1 + 2*b2) ** 0.5
+    # Normalise by B so the statistic is batch-size invariant (T → 0 under N(0,1))
+    T = (pair_term - indiv_term + const_term) / B
 
-    T = pair_term - indiv_term + const_term
     return lam * T.mean()
 
 
