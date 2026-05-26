@@ -86,7 +86,7 @@ def train():
     loader = DataLoader(
         datasets.MNIST("./data", train=True, download=True,
                        transform=transforms.ToTensor()),
-        batch_size=128, shuffle=True,
+        batch_size=512, shuffle=True,
     )
 
     encoder        = Encoder(embed_dim=256).to(device)
@@ -123,7 +123,7 @@ def train():
                 tgt_embeds = all_patch_embeds[:, tgt_idx, :]            # (B, N_tgt, 256)
 
             mse  = F.mse_loss(pred_embeds, tgt_embeds)
-            reg  = sigreg(ctx_embed, lam=0.1)
+            reg  = sigreg(ctx_embed, num_projections=16, lam=0.1)
             loss = mse + reg
 
             optimizer.zero_grad()
