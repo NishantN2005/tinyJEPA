@@ -89,56 +89,94 @@ def train():
                        transform=transforms.ToTensor()),
         batch_size=512, shuffle=True,
     )
+    val_loader = DataLoader(
+        datasets.MNIST("./data", train=False, download=True,
+                       transform=transforms.ToTensor()),
+        batch_size=512, shuffle=False,
+    )
 
     encoder        = Encoder(embed_dim=256).to(device)
-    predictor      = Predictor(embed_dim=256, hidden=1024).to(device)
+    predictor      = Predictor(embed_dim=256, num_heads=4, num_layers=2).to(device)
     target_encoder = copy.deepcopy(encoder).to(device)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
     optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(predictor.parameters()), lr=1e-3,
+        list(encoder.parameters()) + list(predictor.parameters()), lr=3e-4,
+    )
+    warmup    = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-6, end_factor=1.0, total_iters=5
+    )
+    cosine    = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=95, eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[5]
     )
 
-    for epoch in range(300):
+    for epoch in range(100):
         for batch_idx, (images, _) in enumerate(loader):
             images = images.to(device)                           # (B, 1, 28, 28)
+            B = images.shape[0]
 
             # Sample a new random context/target split each step
-            _, tgt_idx = sample_patches()
-            tgt_tensor = torch.tensor(tgt_idx, device=device) \
-                              .unsqueeze(0).expand(images.shape[0], -1)  # (B, N_tgt)
+            ctx_idx, tgt_idx = sample_patches()
+            ctx_tensor = torch.tensor(ctx_idx, device=device).unsqueeze(0).expand(B, -1)
+            tgt_tensor = torch.tensor(tgt_idx, device=device).unsqueeze(0).expand(B, -1)
 
             # Mask target patches before encoding context
             masked = mask_image(images, tgt_idx)
 
-            # Online encoder: context embedding from masked image
-            ctx_embed = encoder.global_embed(masked)             # (B, 256)
+            # Online encoder: global embed (for SIGReg) + per-patch context embeds
+            ctx_global, all_ctx_embeds = encoder.embed_context(masked)
+            ctx_patch_embeds = all_ctx_embeds[:, ctx_idx, :]     # (B, N_ctx, 256)
 
-            # Predictor: predict each target's embedding
-            pred_embeds = predictor(ctx_embed, tgt_tensor)       # (B, N_tgt, 256)
+            # Transformer predictor: attends over context patches to predict targets
+            pred_embeds = predictor(ctx_patch_embeds, ctx_tensor, tgt_tensor)  # (B, N_tgt, 256)
 
             # Target encoder: per-patch embeddings from full image
             with torch.no_grad():
-                all_patch_embeds = target_encoder.patch_embeds(images)  # (B, 16, 256)
-                tgt_embeds = all_patch_embeds[:, tgt_idx, :]            # (B, N_tgt, 256)
+                tgt_embeds = target_encoder.patch_embeds(images)[:, tgt_idx, :]  # (B, N_tgt, 256)
 
             mse  = F.mse_loss(pred_embeds, tgt_embeds)
-            reg  = sigreg(ctx_embed, num_projections=16, lam=0.1)
+            reg  = sigreg(ctx_global, num_projections=16, lam=0.1)
             loss = mse + reg
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(predictor.parameters()), max_norm=1.0
+            )
             optimizer.step()
             update_target_encoder(encoder, target_encoder)
 
             if batch_idx % 100 == 0:
                 with torch.no_grad():
-                    embed_std = ctx_embed.std(dim=0).mean().item()
+                    embed_std = ctx_global.std(dim=0).mean().item()
                 print(f"Epoch {epoch} Batch {batch_idx} | "
                       f"MSE: {mse.item():.4f} | "
                       f"SIGReg: {reg.item():.4f} | "
-                      f"Embed std: {embed_std:.4f}")
+                      f"Embed std: {embed_std:.4f}", flush=True)
+
+        # Validation MSE at end of each epoch (no mode switch — preserves batch norm state)
+        val_mse_total, val_batches = 0.0, 0
+        with torch.no_grad():
+            for val_images, _ in val_loader:
+                val_images = val_images.to(device)
+                Bv = val_images.shape[0]
+                ctx_idx_v, tgt_idx_v = sample_patches()
+                ctx_tensor_v = torch.tensor(ctx_idx_v, device=device).unsqueeze(0).expand(Bv, -1)
+                tgt_tensor_v = torch.tensor(tgt_idx_v, device=device).unsqueeze(0).expand(Bv, -1)
+                masked_v = mask_image(val_images, tgt_idx_v)
+                _, all_ctx_v = encoder.embed_context(masked_v)
+                ctx_patch_v = all_ctx_v[:, ctx_idx_v, :]
+                pred_v = predictor(ctx_patch_v, ctx_tensor_v, tgt_tensor_v)
+                tgt_v  = target_encoder.patch_embeds(val_images)[:, tgt_idx_v, :]
+                val_mse_total += F.mse_loss(pred_v, tgt_v).item()
+                val_batches += 1
+        lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch} | Val MSE: {val_mse_total / val_batches:.4f} | LR: {lr:.2e}", flush=True)
+        scheduler.step()
 
     return encoder
 

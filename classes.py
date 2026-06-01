@@ -7,13 +7,11 @@ GRID_SIZE  = 4   # 4×4 grid → 16 patches cover the full 28×28 image
 
 
 class Encoder(nn.Module):
-    """ResNet-18 backbone with two output modes.
+    """ResNet-18 backbone with three output modes.
 
-    global_embed(x)  — masked image → (B, embed_dim) context vector
-    patch_embeds(x)  — full image   → (B, 16, embed_dim) per-patch vectors
-
-    The 4×4 spatial feature map produced by layer4 aligns perfectly with
-    the 4×4 patch grid (each feature position covers one 7×7 patch).
+    global_embed(x)   — image → (B, embed_dim) global vector
+    patch_embeds(x)   — image → (B, 16, embed_dim) per-patch vectors
+    embed_context(x)  — single forward pass returning both of the above
     """
     def __init__(self, embed_dim=256):
         super().__init__()
@@ -38,47 +36,61 @@ class Encoder(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        return x                                          # (B, 512, 4, 4)
+        return x                                               # (B, 512, 4, 4)
+
+    def embed_context(self, x):
+        """Single pass → global (B, D) and all patch embeddings (B, 16, D)."""
+        feat   = self._features(x)                            # (B, 512, 4, 4)
+        B      = feat.shape[0]
+        global_emb = self.global_proj(self.global_pool(feat).flatten(1))
+        patch_emb  = self.patch_proj(
+            feat.permute(0, 2, 3, 1).reshape(B, GRID_SIZE * GRID_SIZE, 512)
+        )
+        return global_emb, patch_emb                          # (B,D), (B,16,D)
 
     def global_embed(self, x):
-        """Masked image → (B, embed_dim) context embedding."""
         feat   = self._features(x)
-        pooled = self.global_pool(feat).flatten(1)        # (B, 512)
-        return self.global_proj(pooled)                   # (B, embed_dim)
+        return self.global_proj(self.global_pool(feat).flatten(1))
 
     def patch_embeds(self, x):
-        """Full image → (B, 16, embed_dim) per-patch embeddings."""
-        feat = self._features(x)                          # (B, 512, 4, 4)
+        feat = self._features(x)
         B    = feat.shape[0]
         feat = feat.permute(0, 2, 3, 1).reshape(B, GRID_SIZE * GRID_SIZE, 512)
-        return self.patch_proj(feat)                      # (B, 16, embed_dim)
+        return self.patch_proj(feat)
 
     def forward(self, x):
         return self.global_embed(x)
 
 
 class Predictor(nn.Module):
-    """MLP conditioned on context embedding + learnable positional query.
+    """Transformer predictor conditioned on per-patch context embeddings.
 
-    For each target patch the predictor receives:
-        [ctx_embed ‖ pos_embed[patch_idx]]  (2 × embed_dim → embed_dim)
+    Context tokens  = context patch embeddings + positional embeddings
+    Target tokens   = positional embeddings only (no content — these are the queries)
+
+    Both are concatenated and passed through a small transformer.
+    The target-position outputs are projected to produce predicted embeddings.
     """
-    def __init__(self, embed_dim=256, hidden=1024):
+    def __init__(self, embed_dim=256, num_heads=4, num_layers=2):
         super().__init__()
         self.pos_embed = nn.Embedding(GRID_SIZE * GRID_SIZE, embed_dim)
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim * 2, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, embed_dim),
+        encoder_layer  = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=embed_dim * 4, dropout=0.0,
+            batch_first=True, norm_first=True,
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, ctx_embed, patch_indices):
+    def forward(self, ctx_embeds, ctx_indices, tgt_indices):
         """
-        ctx_embed:     (B, embed_dim)
-        patch_indices: (B, N_tgt)  — long tensor of target patch indices
-        Returns:       (B, N_tgt, embed_dim)
+        ctx_embeds:  (B, N_ctx, embed_dim)
+        ctx_indices: (B, N_ctx) long  — positions of visible patches
+        tgt_indices: (B, N_tgt) long  — positions of target patches
+        Returns:     (B, N_tgt, embed_dim)
         """
-        N   = patch_indices.shape[1]
-        pos = self.pos_embed(patch_indices)                    # (B, N, embed_dim)
-        ctx = ctx_embed.unsqueeze(1).expand(-1, N, -1)         # (B, N, embed_dim)
-        return self.net(torch.cat([ctx, pos], dim=-1))         # (B, N, embed_dim)
+        ctx_tokens = ctx_embeds + self.pos_embed(ctx_indices)  # (B, N_ctx, D)
+        tgt_tokens = self.pos_embed(tgt_indices)               # (B, N_tgt, D)
+        tokens     = torch.cat([ctx_tokens, tgt_tokens], dim=1)  # (B, N_ctx+N_tgt, D)
+        out        = self.transformer(tokens)
+        return self.proj(out[:, ctx_tokens.shape[1]:, :])      # (B, N_tgt, D)
