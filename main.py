@@ -20,10 +20,13 @@ N_TARGET  = 4                        # patches to predict each step
 # ---------------------------------------------------------------------------
 
 def sample_patches():
-    """Randomly sample non-overlapping context and target patch indices."""
-    idx = list(range(N_PATCHES))
-    random.shuffle(idx)
-    return idx[:N_CONTEXT], idx[N_CONTEXT:N_CONTEXT + N_TARGET]
+    """Sample a random 2×2 contiguous block as targets; remaining patches are context."""
+    r = random.randint(0, GRID_SIZE - 2)
+    c = random.randint(0, GRID_SIZE - 2)
+    tgt_idx = [r * GRID_SIZE + c, r * GRID_SIZE + c + 1,
+               (r + 1) * GRID_SIZE + c, (r + 1) * GRID_SIZE + c + 1]
+    ctx_idx = [i for i in range(N_PATCHES) if i not in tgt_idx]
+    return ctx_idx, tgt_idx
 
 
 def mask_image(images, target_indices):
@@ -74,7 +77,7 @@ def sigreg(z, num_projections=64, beta=1.0, lam=1.0):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def update_target_encoder(encoder, target_encoder, momentum=0.996):
+def update_target_encoder(encoder, target_encoder, momentum=0.999):
     for p, pt in zip(encoder.parameters(), target_encoder.parameters()):
         pt.data.mul_(momentum).add_(p.data, alpha=1 - momentum)
 
@@ -86,7 +89,10 @@ def update_target_encoder(encoder, target_encoder, momentum=0.996):
 def train():
     loader = DataLoader(
         datasets.MNIST("./data", train=True, download=True,
-                       transform=transforms.ToTensor()),
+                       transform=transforms.Compose([
+                           transforms.RandomCrop(28, padding=2),
+                           transforms.ToTensor(),
+                       ])),
         batch_size=512, shuffle=True,
     )
     val_loader = DataLoader(
