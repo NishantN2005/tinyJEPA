@@ -20,13 +20,21 @@ N_TARGET  = 4                        # patches to predict each step
 # ---------------------------------------------------------------------------
 
 def sample_patches():
-    """Sample a random 2×2 contiguous block as targets; remaining patches are context."""
-    r = random.randint(0, GRID_SIZE - 2)
-    c = random.randint(0, GRID_SIZE - 2)
-    tgt_idx = [r * GRID_SIZE + c, r * GRID_SIZE + c + 1,
-               (r + 1) * GRID_SIZE + c, (r + 1) * GRID_SIZE + c + 1]
-    ctx_idx = [i for i in range(N_PATCHES) if i not in tgt_idx]
-    return ctx_idx, tgt_idx
+    """Sample two non-overlapping random 2×2 blocks as targets; rest are context."""
+    def block_patches(r, c):
+        return {r * GRID_SIZE + c, r * GRID_SIZE + c + 1,
+                (r + 1) * GRID_SIZE + c, (r + 1) * GRID_SIZE + c + 1}
+
+    positions = [(r, c) for r in range(GRID_SIZE - 1) for c in range(GRID_SIZE - 1)]
+    while True:
+        r1, c1 = random.choice(positions)
+        r2, c2 = random.choice(positions)
+        b1, b2 = block_patches(r1, c1), block_patches(r2, c2)
+        if b1 & b2:
+            continue
+        tgt_idx = sorted(b1 | b2)
+        ctx_idx = [i for i in range(N_PATCHES) if i not in tgt_idx]
+        return ctx_idx, tgt_idx
 
 
 def mask_image(images, target_indices):
